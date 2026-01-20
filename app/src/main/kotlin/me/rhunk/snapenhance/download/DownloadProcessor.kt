@@ -77,6 +77,15 @@ class DownloadProcessor (
         fallbackToast(it)
     }
 
+    /**
+     * Sanitizes a file or directory name by replacing characters that are invalid
+     * in Android's Storage Access Framework (SAF).
+     */
+    private fun sanitizeFileName(name: String): String {
+        // Characters invalid in Android/SAF file names: : * ? " < > | / \
+        return name.replace(Regex("[:\\*\\?\"<>|/\\\\]"), "_")
+    }
+
     private fun newFFMpegProcessor(pendingTask: PendingTask) = FFMpegProcessor.newFFMpegProcessor(remoteSideContext, pendingTask)
 
     private fun computeFileHash(inputStream: InputStream): ByteArray {
@@ -117,7 +126,7 @@ class DownloadProcessor (
                 }
             }
 
-            val fileName = metadata.outputPath.substringAfterLast("/") + "." + fileType.fileExtension
+            val fileName = sanitizeFileName(metadata.outputPath.substringAfterLast("/")) + "." + fileType.fileExtension
 
             val outputFolder = DocumentFile.fromTreeUri(remoteSideContext.androidContext,
                 remoteSideContext.config.root.downloader.saveFolder.get().toUri())
@@ -126,7 +135,9 @@ class DownloadProcessor (
             val outputFileFolder = metadata.outputPath.let {
                 if (it.contains("/")) {
                     it.substringBeforeLast("/").split("/").fold(outputFolder) { folder, name ->
-                        folder.findFile(name) ?: folder.createDirectory(name)!!
+                        val sanitizedName = sanitizeFileName(name)
+                        folder.findFile(sanitizedName) ?: folder.createDirectory(sanitizedName)
+                            ?: throw Exception("Failed to create directory: $sanitizedName")
                     }
                 } else {
                     outputFolder
@@ -134,32 +145,38 @@ class DownloadProcessor (
             }
 
             // checks if the file already exists, compares its contents with the input file, if contents differ, deletes existing file.
-            outputFileFolder.takeIf {
-                remoteSideContext.config.root.downloader.fileHashCheck.get()
-            }?.findFile(fileName)?.let { existingFile ->
-                pendingTask.updateProgress("Comparing existing media")
-                if (existingFile.length() != inputFile.length()) {
-                    existingFile.delete()
-                    return@let
-                }
+            val existingFile = outputFileFolder.findFile(fileName)
+            if (existingFile != null) {
+                if (remoteSideContext.config.root.downloader.fileHashCheck.get()) {
+                    pendingTask.updateProgress("Comparing existing media")
+                    if (existingFile.length() != inputFile.length()) {
+                        existingFile.delete()
+                    } else {
+                        val existingFileHash = remoteSideContext.androidContext.contentResolver.openInputStream(existingFile.uri)?.let {
+                            computeFileHash(it)
+                        }
+                        val inputFileHash = computeFileHash(inputFile.inputStream())
 
-                val existingFileHash = remoteSideContext.androidContext.contentResolver.openInputStream(existingFile.uri)?.let {
-                    computeFileHash(it)
+                        if (existingFileHash == null || !existingFileHash.contentEquals(inputFileHash)) {
+                            existingFile.delete()
+                        } else {
+                            pendingTask.task.extra = existingFile.uri.toString()
+                            pendingTask.success()
+                            callbackOnFailure(translation["already_downloaded_toast"])
+                            return
+                        }
+                    }
+                } else {
+                    // File exists but hash check disabled - treat as already downloaded
+                    pendingTask.task.extra = existingFile.uri.toString()
+                    pendingTask.success()
+                    callbackOnFailure(translation["already_downloaded_toast"])
+                    return
                 }
-                val inputFileHash = computeFileHash(inputFile.inputStream())
-
-                if (existingFileHash == null || !existingFileHash.contentEquals(inputFileHash)) {
-                    existingFile.delete()
-                    return@let
-                }
-
-                pendingTask.task.extra = existingFile.uri.toString()
-                pendingTask.success()
-                callbackOnFailure(translation["already_downloaded_toast"])
-                return
             }
 
-            val outputFile = outputFileFolder.createFile(fileType.mimeType, fileName)!!
+            val outputFile = outputFileFolder.createFile(fileType.mimeType, fileName)
+                ?: throw Exception("Failed to create file: $fileName")
 
             pendingTask.updateProgress("Saving media to gallery")
             remoteSideContext.androidContext.contentResolver.openOutputStream(outputFile.uri)!!.use { outputStream ->
